@@ -1,0 +1,122 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Immich 随机图库</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <div id="blur-backdrop" class="blur-backdrop">
+    <div class="blur-layer layer-a"></div>
+    <div class="blur-layer layer-b"></div>
+  </div>
+  <div class="page">
+    <header class="top-bar">
+      <div>
+        <h1>Immich 随机图库</h1>
+      </div>
+      <div class="top-actions">
+        <button id="btn-prev" class="primary small prev-button" disabled>返回上一轮</button>
+        <button id="btn-refresh" class="secondary small subtle">重新抽一组</button>
+        <button id="btn-reset" class="secondary small subtle">重置已看记录</button>
+        <select id="theme-select" class="secondary small">
+          <option value="rainbow">流动彩虹</option>
+          <option value="gradient">纯色渐变</option>
+          <option value="blur">模糊首图</option>
+        </select>
+        <button id="btn-debug" class="ghost-button">Debug</button>
+      </div>
+    </header>
+
+    <section class="grid-wrapper">
+      <div id="grid" class="grid"></div>
+    </section>
+
+    <section class="controls bottom-controls">
+      <div class="action-row">
+        <div class="control-group left">
+          <select id="grid-preset" class="secondary">
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="6" selected>6</option>
+            <option value="9">9</option>
+            <option value="12">12</option>
+            <option value="25">25</option>
+            <option value="custom">自定义</option>
+          </select>
+          <div id="grid-custom" class="grid-custom hidden">
+            <input type="number" id="grid-count" class="small-input" min="1" max="99" placeholder="数量" />
+            <button id="grid-apply" class="secondary small">应用</button>
+          </div>
+        </div>
+        <button id="btn-next" class="primary">下一轮（执行标记）</button>
+        <div class="control-group right">
+          <select id="filter-mode" class="secondary">
+            <option value="all">所有图片</option>
+            <option value="exclude-prescreen" selected>预筛过图片除外</option>
+            <option value="exclude-albums">所有相册照片除外</option>
+          </select>
+        </div>
+      </div>
+      <div id="status-text">加载中…</div>
+    </section>
+
+    <footer class="footer">
+      <div class="hint">提示：数量和图片过滤在下一轮生效。可选数量：3 / 4 / 6（默认） / 9 / 12 / 25 或自定义。点击切换删除/收藏/无标记；鼠标滚轮在图片上可放大预览（三档：1.5x / 2x / 3x）。</div>
+    </footer>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <aside id="debug-panel" class="debug-panel">
+    <div class="debug-header">
+      <h3>调试视窗</h3>
+      <button id="btn-debug-close" class="ghost-button">收起</button>
+    </div>
+    <div class="debug-section">
+      <h4>当前配置</h4>
+      <ul class="debug-list">
+        <li>IMMICH_BASE_URL：<span id="dbg-base-url"></span></li>
+        <li>API Key：<span id="dbg-api-key"></span></li>
+        <li>数量：<span id="dbg-grid"></span></li>
+        <li>主题：<span id="dbg-theme"></span></li>
+        <li>DB_PATH：<span id="dbg-db-path"></span></li>
+      </ul>
+    </div>
+    <div class="debug-section">
+      <h4>健康检查</h4>
+      <div id="dbg-health">加载中...</div>
+      <button id="btn-debug-refresh" class="secondary small">刷新状态</button>
+    </div>
+    <div class="debug-section">
+      <h4>最近 API 调用</h4>
+      <div id="dbg-logs" class="debug-logs">暂无日志</div>
+    </div>
+    <div class="debug-section">
+      <h4>当前批次</h4>
+      <div id="dbg-range">等待加载...</div>
+    </div>
+    <div class="debug-section">
+      <h4>数据库文件</h4>
+      <div id="dbg-db-info">加载中...</div>
+      <button id="btn-db-fix" class="secondary small">修复数据库</button>
+    </div>
+  </aside>
+
+  <script>
+    window.appConfig = {
+      gridCount: {{ grid_count }},
+      filterMode: "{{ filter_mode }}",
+      theme: "{{ theme }}",
+      searchMaxPages: {{ search_max_pages }},
+      debugMode: {{ 'true' if debug_mode else 'false' }},
+      immichBaseUrl: "{{ immich_base_url }}",
+      apiKeyConfigured: {{ 'true' if api_key_configured else 'false' }},
+      dbPath: "{{ db_path }}"
+    };
+  </script>
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
