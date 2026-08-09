@@ -237,14 +237,17 @@ class ImmichClient:
             items_field = data.get("items") or data.get("assets") or data.get("data") or []
             total_count = (
                 data.get("totalCount")
-                or data.get("count")
                 or data.get("total")
                 or total_count
             )
 
         if isinstance(items_field, dict):
             if total_count is None:
-                for key in ("totalCount", "total", "count"):
+                # `count` is the number of items in the current result page in
+                # current Immich responses, not the library-wide total. Using
+                # it as a total makes every full page look like a one-page
+                # library. Only explicit total fields are safe here.
+                for key in ("totalCount", "total"):
                     if items_field.get(key) is not None:
                         total_count = items_field.get(key)
                         break

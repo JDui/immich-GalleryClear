@@ -140,6 +140,37 @@ class SamplingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.total_pages_considered, 1100)
         self.assertEqual(result.total_returned, 1)
 
+    async def test_validated_page_cache_wins_over_incorrect_server_count(self):
+        fake = FakeImmichClient(
+            {
+                1: [asset("a1"), asset("a2")],
+                2: [asset("b1"), asset("b2")],
+                3: [asset("c1")],
+            },
+            # Reproduces Immich's per-page `count` being misread as a total.
+            total=1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SeenRepository(str(Path(tmp) / "state.db"))
+            main._page_cache.clear()
+            with (
+                patch.object(main, "PAGE_SIZE", 2),
+                patch.object(main, "seen_repo", repo),
+                patch.object(main, "immich_client", fake),
+                patch.object(
+                    main,
+                    "get_album_id_cached",
+                    AsyncMock(return_value="seen-album"),
+                ),
+            ):
+                first = await main.fetch_random_assets(
+                    1, "all", force_validate_pages=True
+                )
+                second = await main.fetch_random_assets(1, "all")
+
+        self.assertEqual(first.total_pages_considered, 3)
+        self.assertEqual(second.total_pages_considered, 3)
+
     async def test_filter_lookup_failure_is_not_silently_ignored(self):
         fake = FakeImmichClient({1: [asset("a1")]}, total=1)
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +252,26 @@ class ClientConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in items], ["one"])
         self.assertEqual(total, 123)
+
+    async def test_nested_search_count_is_not_treated_as_total(self):
+        client = ImmichClient("http://immich.test", "test-key")
+        response = httpx.Response(
+            200,
+            json={
+                "assets": {
+                    "items": [asset("one")],
+                    "count": 1,
+                    "nextPage": "2",
+                }
+            },
+            request=httpx.Request("POST", "http://immich.test/api/search/metadata"),
+        )
+        client._request = AsyncMock(return_value=response)
+
+        items, total = await client.search_assets(page=1, size=20)
+
+        self.assertEqual([item["id"] for item in items], ["one"])
+        self.assertIsNone(total)
 
     async def test_duplicate_album_membership_is_not_reported_as_failure(self):
         client = ImmichClient("http://immich.test", "test-key")

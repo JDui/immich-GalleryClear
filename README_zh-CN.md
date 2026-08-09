@@ -34,7 +34,7 @@ version: "3.8"
 
 services:
   immich-random-cleaner:
-    image: immich-random-cleaner:0.7.27
+    image: immich-random-cleaner:0.7.28
     container_name: immich-random-cleaner
     restart: unless-stopped
     ports:
@@ -68,19 +68,19 @@ http://你的服务器IP:8787/
 ## 使用本仓库构建镜像
 
 ```bash
-docker build -t immich-random-cleaner:0.7.27 .
+docker build -t immich-random-cleaner:0.7.28 .
 ```
 
 如需导出镜像到其他机器：
 
 ```bash
-docker save immich-random-cleaner:0.7.27 -o immich-random-cleaner-0.7.27.tar
+docker save immich-random-cleaner:0.7.28 -o immich-random-cleaner-0.7.28.tar
 ```
 
 导入：
 
 ```bash
-docker load -i immich-random-cleaner-0.7.27.tar
+docker load -i immich-random-cleaner-0.7.28.tar
 ```
 
 本仓库也提供了示例文件 [docker-compose.example.jks.yml](./docker-compose.example.jks.yml)，可直接复制后修改。

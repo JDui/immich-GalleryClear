@@ -510,10 +510,13 @@ async def fetch_random_assets(
         last_page: Optional[int] = None
         if force_validate_pages:
             last_page = await detect_last_page()
+        elif cache_valid and last_page_cache:
+            # A validated/detected page count is stronger evidence than a
+            # server total. Some Immich versions expose a per-page `count`
+            # that older clients may have cached as the total.
+            last_page = last_page_cache
         elif pages_from_total:
             last_page = pages_from_total
-        elif cache_valid and last_page_cache:
-            last_page = last_page_cache
         else:
             last_page = await detect_last_page()
 
