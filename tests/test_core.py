@@ -171,6 +171,38 @@ class SamplingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.total_pages_considered, 3)
         self.assertEqual(second.total_pages_considered, 3)
 
+    async def test_recorded_pages_block_second_round_collapse_after_cache_clear(self):
+        fake = FakeImmichClient(
+            {
+                1: [asset("a1"), asset("a2")],
+                2: [asset("b1"), asset("b2")],
+                3: [asset("c1")],
+            },
+            total=1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SeenRepository(str(Path(tmp) / "state.db"))
+            repo.set_total_pages_record(3)
+            repo.set_meta("total_assets", "5")
+            main._page_cache.clear()
+            with (
+                patch.object(main, "PAGE_SIZE", 2),
+                patch.object(main, "seen_repo", repo),
+                patch.object(main, "immich_client", fake),
+                patch.object(
+                    main,
+                    "get_album_id_cached",
+                    AsyncMock(return_value="seen-album"),
+                ),
+            ):
+                result = await main.fetch_random_assets(1, "all")
+                cached_pages, cached_total, _ = main._page_cache[2]
+
+        self.assertEqual(result.total_pages_considered, 3)
+        self.assertIsNone(result.total_assets)
+        self.assertEqual(cached_pages, 3)
+        self.assertIsNone(cached_total)
+
     async def test_filter_lookup_failure_is_not_silently_ignored(self):
         fake = FakeImmichClient({1: [asset("a1")]}, total=1)
         with tempfile.TemporaryDirectory() as tmp:

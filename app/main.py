@@ -516,11 +516,25 @@ async def fetch_random_assets(
             # that older clients may have cached as the total.
             last_page = last_page_cache
         elif pages_from_total:
-            last_page = pages_from_total
+            # A library can shrink, but a reported total must not silently
+            # collapse a previously verified multi-page library. This path is
+            # especially important after deletes clear the in-memory cache.
+            # Probe the real tail before accepting any downward page change.
+            if recorded_total and pages_from_total < recorded_total:
+                last_page = await detect_last_page()
+            else:
+                last_page = pages_from_total
         else:
             last_page = await detect_last_page()
 
         last_page = max(1, last_page or 1)
+        if total_assets is not None:
+            reported_pages = max(1, math.ceil(total_assets / page_size))
+            if reported_pages < last_page:
+                # The page probe found assets beyond the claimed total. Keep
+                # the verified page count and discard the contradictory total
+                # so it cannot poison the next cache cycle.
+                total_assets = None
         _page_cache[page_size] = (last_page, total_assets, time.monotonic())
 
         recorded_total = seen_repo.get_total_pages_record()
