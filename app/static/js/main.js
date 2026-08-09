@@ -238,9 +238,19 @@ function applyTheme(theme) {
 function computeGridColumns(count) {
   const gridWidth = gridEl.clientWidth || (gridEl.parentElement ? gridEl.parentElement.clientWidth : 0) || window.innerWidth;
   const gap = parseFloat(getComputedStyle(gridEl).gap) || 10;
-  const aspect = window.innerWidth / Math.max(1, window.innerHeight || 1);
+  const viewportWidth = window.visualViewport?.width || window.innerWidth;
+  const viewportHeight = window.visualViewport?.height || window.innerHeight || 1;
+  const aspect = viewportWidth / Math.max(1, viewportHeight);
   let minCardWidth = 300;
-  if (aspect >= 4 / 3) {
+  if (viewportWidth <= 480) {
+    // Narrow phones work best as a compact two-column review surface.
+    minCardWidth = 132;
+  } else if (viewportWidth <= 900 && aspect >= 0.95 && aspect <= 1.5) {
+    // Foldable and tablet-like square screens can comfortably show three columns.
+    minCardWidth = 170;
+  } else if (viewportWidth <= 900) {
+    minCardWidth = 210;
+  } else if (aspect >= 4 / 3) {
     minCardWidth = 250;
   } else if (aspect >= 1.1) {
     minCardWidth = 280;

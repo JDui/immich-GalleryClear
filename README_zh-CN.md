@@ -7,10 +7,12 @@
 ## 功能特性
 
 - 随机抽取 Immich 图片，默认展示 6 张，可在页面中切换 3 / 4 / 6 / 9 / 12 / 25 或自定义数量。
+- 每轮先等概率随机一个页码，再在该页内随机选图；仅当单页候选不足时才继续扫描其他随机页，全部候选页都不足时才使用已看图片补位。
 - 点击图片循环切换标记：待删除 -> 收藏到相册 -> 无标记。
 - 点击“下一轮（执行标记）”后，待删除图片会移入 Immich 回收站，收藏图片会加入 `iCCollection` 相册。
 - 自动维护预筛记录相册 `immichClearSeen`，默认过滤已经预筛过的图片，减少重复出现。
 - 支持过滤模式：所有图片、预筛相册除外、所有相册照片除外。
+- 页面耗尽状态按过滤模式隔离；删除、恢复或相册缓存变化时会自动失效，避免跳过仍可筛选的图片。
 - 支持返回上一轮，并尽量回滚上一轮已经执行的删除/收藏动作。
 - 支持 GIF 原图预览，缩略图失败时会回退显示占位提示。
 - 内置调试视窗，可查看 Immich 连接状态、最近 API 调用日志、数据库文件状态，并尝试修复数据库。
@@ -32,7 +34,7 @@ version: "3.8"
 
 services:
   immich-random-cleaner:
-    image: immich-random-cleaner:0.7.25
+    image: immich-random-cleaner:0.7.27
     container_name: immich-random-cleaner
     restart: unless-stopped
     ports:
@@ -66,19 +68,19 @@ http://你的服务器IP:8787/
 ## 使用本仓库构建镜像
 
 ```bash
-docker build -t immich-random-cleaner:0.7.25 .
+docker build -t immich-random-cleaner:0.7.27 .
 ```
 
 如需导出镜像到其他机器：
 
 ```bash
-docker save immich-random-cleaner:0.7.25 -o immich-random-cleaner-0.7.25.tar
+docker save immich-random-cleaner:0.7.27 -o immich-random-cleaner-0.7.27.tar
 ```
 
 导入：
 
 ```bash
-docker load -i immich-random-cleaner-0.7.25.tar
+docker load -i immich-random-cleaner-0.7.27.tar
 ```
 
 本仓库也提供了示例文件 [docker-compose.example.jks.yml](./docker-compose.example.jks.yml)，可直接复制后修改。
@@ -94,10 +96,12 @@ docker load -i immich-random-cleaner-0.7.25.tar
 | `IMMICH_LOG_SIZE` | `50` | 调试面板保留的最近 Immich API 调用日志数量。 |
 | `IMMICH_MIN_INTERVAL_MS` | `10` | 调用 Immich API 的最小间隔，单位毫秒。 |
 | `IMMICH_MAX_CONCURRENCY` | `10` | 调用 Immich API 的最大并发数。 |
-| `ALBUM_CACHE_TTL_SEC` | `0` | 单个相册资源缓存时间。`0` 表示进程内长期有效。 |
-| `ALBUM_ID_CACHE_TTL_SEC` | `0` | 相册 ID 缓存时间。 |
-| `ALL_ALBUM_CACHE_TTL_SEC` | `0` | “所有相册照片除外”模式下的全相册资源缓存时间。 |
-| `PAGES_CACHE_TTL_SEC` | `0` | Immich 资源页数缓存时间。 |
+| `ALBUM_CACHE_TTL_SEC` | `60` | 单个相册资源缓存时间。`0` 表示进程内长期有效。 |
+| `ALBUM_ID_CACHE_TTL_SEC` | `300` | 相册 ID 缓存时间。 |
+| `ALL_ALBUM_CACHE_TTL_SEC` | `60` | “所有相册照片除外”模式下的全相册资源缓存时间。 |
+| `PAGES_CACHE_TTL_SEC` | `300` | Immich 资源页数缓存时间。 |
+| `MAX_GRID_COUNT` | `500` | 单轮允许请求的最大图片数量；超过单页大小时会自动跨页补齐。 |
+| `PAGE_PROBE_LIMIT` | `1048576` | Immich 未返回总数时，页数探测的安全上限。 |
 | `SEARCH_MAX_PAGES` | `30` | 兼容旧配置，目前页面仅展示该配置值。 |
 | `DEBUG_MODE` | `false` | 调试模式标记，会显示在页面配置中。 |
 

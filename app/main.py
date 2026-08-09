@@ -1,9 +1,11 @@
 ﻿import math
+import asyncio
 import os
 import random
 import sqlite3
 import time
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -49,6 +51,7 @@ DEFAULT_FILTER_MODE = "exclude-prescreen"
 DEFAULT_THEME = "rainbow"
 THEME_OPTIONS = {"rainbow", "gradient", "blur"}
 PAGE_SIZE = 200
+MAX_GRID_COUNT = get_env_int("MAX_GRID_COUNT", 500)
 
 SEARCH_MAX_PAGES = get_env_int("SEARCH_MAX_PAGES", 30)
 
@@ -60,10 +63,21 @@ FAV_ALBUM_NAME = "iCCollection"
 IMMICH_LOG_SIZE = get_env_int("IMMICH_LOG_SIZE", 50)
 IMMICH_MIN_INTERVAL_MS = get_env_int("IMMICH_MIN_INTERVAL_MS", 10)
 IMMICH_MAX_CONCURRENCY = get_env_int("IMMICH_MAX_CONCURRENCY", 10)
-ALBUM_CACHE_TTL_SEC = get_env_int("ALBUM_CACHE_TTL_SEC", 0)
-ALBUM_ID_CACHE_TTL_SEC = get_env_int("ALBUM_ID_CACHE_TTL_SEC", 0)
-ALL_ALBUM_CACHE_TTL_SEC = get_env_int("ALL_ALBUM_CACHE_TTL_SEC", 0)
-PAGES_CACHE_TTL_SEC = get_env_int("PAGES_CACHE_TTL_SEC", 0)
+ALBUM_CACHE_TTL_SEC = get_env_int("ALBUM_CACHE_TTL_SEC", 60)
+ALBUM_ID_CACHE_TTL_SEC = get_env_int("ALBUM_ID_CACHE_TTL_SEC", 300)
+ALL_ALBUM_CACHE_TTL_SEC = get_env_int("ALL_ALBUM_CACHE_TTL_SEC", 60)
+PAGES_CACHE_TTL_SEC = get_env_int("PAGES_CACHE_TTL_SEC", 300)
+PAGE_PROBE_LIMIT = get_env_int("PAGE_PROBE_LIMIT", 1_048_576)
+
+
+def validate_count(count: int) -> None:
+    if count <= 0:
+        raise HTTPException(status_code=400, detail="count 必须大于 0")
+    if count > MAX_GRID_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"count 不能超过 {MAX_GRID_COUNT}",
+        )
 
 # If DB_PATH is set to empty string, fall back to default to avoid sqlite errors
 _db_env = os.getenv("DB_PATH")
@@ -133,14 +147,10 @@ async def get_album_id_cached(name: str, *, create_if_missing: bool = False) -> 
     entry = _album_id_cache.get(name)
     if entry and _is_cache_valid(entry[1], ALBUM_ID_CACHE_TTL_SEC):
         return entry[0]
-    album_id = None
-    try:
-        if create_if_missing:
-            album_id = await immich_client.ensure_album(name)
-        else:
-            album_id = await immich_client.find_album_by_name(name)
-    except Exception:
-        album_id = None
+    if create_if_missing:
+        album_id = await immich_client.ensure_album(name)
+    else:
+        album_id = await immich_client.find_album_by_name(name)
     if album_id:
         _album_id_cache[name] = (album_id, time.monotonic())
     return album_id
@@ -154,7 +164,12 @@ async def get_album_asset_ids_cached(name: str) -> Set[str]:
         _album_asset_cache[name] = (set(), time.monotonic())
         return set()
     ids = set(await immich_client.list_album_asset_ids(album_id))
+    previous_ids = entry[0] if entry else None
     _album_asset_cache[name] = (ids, time.monotonic())
+    if previous_ids is not None and previous_ids != ids:
+        if name in {SEEN_ALBUM_NAME, FAV_ALBUM_NAME}:
+            seen_repo.clear_exhausted_pages("exclude-prescreen")
+        seen_repo.clear_exhausted_pages("exclude-albums")
     return set(ids)
 
 async def get_all_album_asset_ids_cached() -> Set[str]:
@@ -162,7 +177,10 @@ async def get_all_album_asset_ids_cached() -> Set[str]:
     if _all_album_asset_cache and _is_cache_valid(_all_album_asset_cache[1], ALL_ALBUM_CACHE_TTL_SEC):
         return set(_all_album_asset_cache[0])
     ids = set(await immich_client.list_all_album_asset_ids())
+    previous_ids = _all_album_asset_cache[0] if _all_album_asset_cache else None
     _all_album_asset_cache = (ids, time.monotonic())
+    if previous_ids is not None and previous_ids != ids:
+        seen_repo.clear_exhausted_pages("exclude-albums")
     return set(ids)
 
 def cache_add_album_assets(name: str, ids: List[str]) -> None:
@@ -188,17 +206,59 @@ def cache_remove_album_assets(name: str, ids: List[str]) -> None:
     if _all_album_asset_cache:
         _all_album_asset_cache[0].difference_update(ids)
         _all_album_asset_cache = (_all_album_asset_cache[0], time.monotonic())
+    if name in {SEEN_ALBUM_NAME, FAV_ALBUM_NAME}:
+        seen_repo.clear_exhausted_pages("exclude-prescreen")
+    seen_repo.clear_exhausted_pages("exclude-albums")
 
 def clear_album_cache(name: str) -> None:
     global _all_album_asset_cache
     _album_asset_cache.pop(name, None)
     _album_id_cache.pop(name, None)
     _all_album_asset_cache = None
+    if name in {SEEN_ALBUM_NAME, FAV_ALBUM_NAME}:
+        seen_repo.clear_exhausted_pages("exclude-prescreen")
+    seen_repo.clear_exhausted_pages("exclude-albums")
 
 
 app = FastAPI(title="Immich Random Cleaner", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+_operation_lock = asyncio.Lock()
+
+
+def serialized_operation(func):
+    """Serialize stateful UI operations across tabs in this single-worker app."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with _operation_lock:
+            return await func(*args, **kwargs)
+
+    return wrapper
+
+
+def random_page_order(pages: Set[int]) -> List[int]:
+    """Pick the first page uniformly, then randomize any overflow pages."""
+    remaining = list(pages)
+    if not remaining:
+        return []
+    first_page = random.choice(remaining)
+    remaining.remove(first_page)
+    random.shuffle(remaining)
+    return [first_page, *remaining]
+
+
+async def load_excluded_ids(filter_mode: str) -> Set[str]:
+    if filter_mode == "all":
+        return set()
+    if filter_mode == "exclude-prescreen":
+        seen_ids, favorite_ids = await asyncio.gather(
+            get_album_asset_ids_cached(SEEN_ALBUM_NAME),
+            get_album_asset_ids_cached(FAV_ALBUM_NAME),
+        )
+        return set(seen_ids) | set(favorite_ids)
+    if filter_mode == "exclude-albums":
+        return set(await get_all_album_asset_ids_cached())
+    raise HTTPException(status_code=400, detail="filter_mode 无效")
 
 
 def normalize_asset(item: dict) -> Optional[AssetItem]:
@@ -267,18 +327,14 @@ def store_prev_round(
     count: int, filter_mode: str, assets: List[RoundAsset], ready: bool
 ) -> None:
     payload = build_round_snapshot(count, filter_mode, assets)
-    seen_repo.set_prev_round(payload)
-    if ready:
-        seen_repo.set_prev_ready(True)
+    seen_repo.set_prev_round(payload, ready=ready)
 
 
 def store_current_round(
     count: int, filter_mode: str, assets: List[RoundAsset], ready: bool
 ) -> None:
     payload = build_round_snapshot(count, filter_mode, assets)
-    seen_repo.set_current_round(payload)
-    if ready:
-        seen_repo.set_current_ready(True)
+    seen_repo.set_current_round(payload, ready=ready)
 
 
 def snapshot_assets_to_items(raw_assets: list) -> List[AssetItem]:
@@ -340,8 +396,7 @@ def store_current_round_from_items(
 
 
 def adjust_counter(key: str, delta: int) -> None:
-    current = seen_repo.get_counter(key)
-    seen_repo.set_meta(key, str(max(0, current + delta)))
+    seen_repo.incr_counter(key, delta)
 
 
 async def fetch_random_assets(
@@ -349,6 +404,9 @@ async def fetch_random_assets(
     filter_mode: str = "all",
     force_validate_pages: bool = False,
 ) -> RandomResponse:
+    validate_count(count)
+    if filter_mode not in {"all", "exclude-prescreen", "exclude-albums"}:
+        raise HTTPException(status_code=400, detail="filter_mode 无效")
     if not IMMICH_BASE_URL or not IMMICH_API_KEY:
         raise HTTPException(
             status_code=500,
@@ -356,12 +414,13 @@ async def fetch_random_assets(
         )
 
     page_size = PAGE_SIZE
-    all_assets: List[AssetItem] = []
     pages_used: List[int] = []
     total_pages_calculated: Optional[int] = None
     total_assets: Optional[int] = None
     stats_debug: Optional[str] = None
     message: Optional[str] = None
+    time_start = datetime.now().isoformat()
+    time_end: Optional[str] = None
     previous_available = seen_repo.is_prev_ready()
 
     pages_cache: Dict[int, List[AssetItem]] = {}
@@ -387,7 +446,7 @@ async def fetch_random_assets(
             parsed_first = [normalize_asset(item) for item in first_items]
             parsed_first = [p for p in parsed_first if p is not None]
             pages_cache[1] = parsed_first
-            if total_count and total_count > page_size:
+            if total_count is not None and total_count >= 0:
                 total_assets = total_count
 
         async def detect_last_page() -> int:
@@ -397,23 +456,31 @@ async def fetch_random_assets(
                 parsed_first = [normalize_asset(item) for item in items]
                 parsed_first = [p for p in parsed_first if p is not None]
                 pages_cache[1] = parsed_first
-            last_non_empty = 1 if parsed_first else 0
+            if not parsed_first:
+                return 1
+            last_non_empty = 1
             step = 1
-            upper_bound = 2
-            while step < 2048:
+            upper_bound: Optional[int] = None
+            first_page_ids = tuple(item.id for item in parsed_first)
+            while upper_bound is None:
                 probe_page = max(2, last_non_empty + step)
+                if probe_page > PAGE_PROBE_LIMIT:
+                    raise RuntimeError(
+                        f"分页探测超过安全上限 {PAGE_PROBE_LIMIT}，请检查 Immich 分页响应"
+                    )
                 items, _ = await immich_client.search_assets(
                     page=probe_page, size=page_size
                 )
                 parsed = [normalize_asset(item) for item in items]
                 parsed = [p for p in parsed if p is not None]
                 if parsed:
+                    if tuple(item.id for item in parsed) == first_page_ids:
+                        raise RuntimeError("Immich 分页响应重复第一页，无法安全探测总页数")
                     last_non_empty = probe_page
                     pages_cache[probe_page] = parsed
                     step *= 2
                 else:
                     upper_bound = probe_page
-                    break
             low = last_non_empty
             high = upper_bound
             while high - low > 1:
@@ -430,9 +497,11 @@ async def fetch_random_assets(
                     high = mid
             return max(1, low)
 
-        pages_from_total = math.ceil(total_assets / page_size) if total_assets else None
-        if pages_from_total and pages_from_total < 1:
-            pages_from_total = 1
+        pages_from_total = (
+            max(1, math.ceil(total_assets / page_size))
+            if total_assets is not None
+            else None
+        )
 
         recorded_total = seen_repo.get_total_pages_record()
         if recorded_total is not None and recorded_total < 1:
@@ -445,8 +514,6 @@ async def fetch_random_assets(
             last_page = pages_from_total
         elif cache_valid and last_page_cache:
             last_page = last_page_cache
-        elif recorded_total:
-            last_page = recorded_total
         else:
             last_page = await detect_last_page()
 
@@ -454,13 +521,32 @@ async def fetch_random_assets(
         _page_cache[page_size] = (last_page, total_assets, time.monotonic())
 
         recorded_total = seen_repo.get_total_pages_record()
-        if recorded_total is not None and recorded_total != last_page:
+        recorded_assets_raw = seen_repo.get_meta("total_assets")
+        try:
+            recorded_assets = int(recorded_assets_raw) if recorded_assets_raw is not None else None
+        except Exception:
+            recorded_assets = None
+        library_changed = (
+            (recorded_total is not None and recorded_total != last_page)
+            or (
+                total_assets is not None
+                and recorded_assets is not None
+                and recorded_assets != total_assets
+            )
+        )
+        if library_changed:
             seen_repo.clear_exhausted_pages()
         if recorded_total != last_page:
             seen_repo.set_total_pages_record(last_page)
+        if total_assets is not None and recorded_assets != total_assets:
+            seen_repo.set_meta("total_assets", str(total_assets))
 
-        exhausted_pages = seen_repo.get_exhausted_pages()
+        # Refresh filter inputs before trusting a fully exhausted state. A TTL
+        # refresh may discover externally removed album membership and reopen pages.
+        excluded_ids = await load_excluded_ids(filter_mode)
+        exhausted_pages = seen_repo.get_exhausted_pages(filter_mode)
         available_pages = set(range(1, last_page + 1)) - exhausted_pages
+        total_pages_calculated = last_page
 
         if not available_pages:
             return RandomResponse(
@@ -475,40 +561,137 @@ async def fetch_random_assets(
                 pages_used=None,
                 total_pages_considered=last_page,
                 total_assets=total_assets,
-                stats_debug=stats_debug,
+                stats_debug="scanned_pages=0",
                 previous_available=previous_available,
                 is_previous=False,
                 round_count=count,
                 round_filter=filter_mode,
             )
 
-        all_assets = []
-        pages_used = []
-        while available_pages and not all_assets:
-            rand_page = random.choice(list(available_pages))
-            available_pages.remove(rand_page)
+        # Preserve the original two-stage random behavior: choose a page
+        # uniformly first, then choose random assets within that page. Other
+        # pages are visited in random order only when the first page cannot
+        # fill the requested count after filtering.
+        page_order = random_page_order(available_pages)
 
-            parsed = pages_cache.get(rand_page)
+        selected: List[AssetItem] = []
+        selected_ids: Set[str] = set()
+        fallback_reservoir: List[AssetItem] = []
+        fallback_reservoir_ids: Set[str] = set()
+        fallback_seen = 0
+        pending_exhausted: Dict[int, Set[str]] = {}
+
+        def consider_fallback(asset: AssetItem) -> None:
+            nonlocal fallback_seen
+            if (
+                asset.id not in excluded_ids
+                or asset.id in selected_ids
+                or asset.id in fallback_reservoir_ids
+            ):
+                return
+            fallback_seen += 1
+            if len(fallback_reservoir) < count:
+                fallback_reservoir.append(asset)
+                fallback_reservoir_ids.add(asset.id)
+                return
+            replacement = random.randrange(fallback_seen)
+            if replacement < count:
+                fallback_reservoir_ids.discard(fallback_reservoir[replacement].id)
+                fallback_reservoir[replacement] = asset
+                fallback_reservoir_ids.add(asset.id)
+
+        for page in page_order:
+            pages_used.append(page)
+            parsed = pages_cache.get(page)
             if parsed is None:
-                items, _ = await immich_client.search_assets(
-                    page=rand_page, size=page_size
+                items, _ = await immich_client.search_assets(page=page, size=page_size)
+                normalized = [normalize_asset(item) for item in items]
+                parsed = [item for item in normalized if item is not None]
+                pages_cache[page] = parsed
+
+            page_assets = list({asset.id: asset for asset in parsed}.values())
+            if not page_assets:
+                seen_repo.mark_page_exhausted(page, filter_mode)
+                continue
+
+            for asset in page_assets:
+                consider_fallback(asset)
+
+            eligible = [
+                asset
+                for asset in page_assets
+                if asset.id not in excluded_ids and asset.id not in selected_ids
+            ]
+            if not eligible:
+                if filter_mode != "all":
+                    seen_repo.mark_page_exhausted(page, filter_mode)
+                continue
+
+            remaining = count - len(selected)
+            chosen = random.sample(eligible, min(remaining, len(eligible)))
+            selected.extend(chosen)
+            selected_ids.update(asset.id for asset in chosen)
+            if filter_mode != "all" and len(eligible) <= remaining:
+                pending_exhausted[page] = {asset.id for asset in eligible}
+            if len(selected) >= count:
+                break
+
+        used_seen_fallback = False
+        if len(selected) < count and fallback_reservoir:
+            remaining = count - len(selected)
+            extras = random.sample(
+                fallback_reservoir, min(remaining, len(fallback_reservoir))
+            )
+            selected.extend(extras)
+            selected_ids.update(asset.id for asset in extras)
+            used_seen_fallback = bool(extras)
+
+        to_mark_seen = [
+            asset.id
+            for asset in selected
+            if filter_mode == "all" or asset.id not in excluded_ids
+        ]
+        successful_seen_ids: Set[str] = set()
+        if to_mark_seen:
+            try:
+                seen_album_id = await get_album_id_cached(
+                    SEEN_ALBUM_NAME, create_if_missing=True
                 )
-                parsed = [normalize_asset(item) for item in items]
-                parsed = [p for p in parsed if p is not None]
-                pages_cache[rand_page] = parsed
+                if not seen_album_id:
+                    raise RuntimeError("预筛记录相册不可用")
+                failed_seen, added_seen = await immich_client.add_assets_to_album(
+                    seen_album_id, to_mark_seen
+                )
+                failed_seen_ids = set(failed_seen)
+                successful_seen_ids = set(to_mark_seen) - failed_seen_ids
+                if added_seen:
+                    seen_repo.incr_counter("seen_count", len(set(added_seen)))
+                if successful_seen_ids:
+                    cache_add_album_assets(
+                        SEEN_ALBUM_NAME, list(successful_seen_ids)
+                    )
+                if failed_seen_ids:
+                    message = f"{len(failed_seen_ids)} 张图片未能写入预筛记录。"
+            except Exception as exc:
+                message = f"图片已返回，但预筛记录写入失败：{exc}"
 
-            if parsed:
-                pages_used = [rand_page]
-                all_assets = parsed
-            else:
-                seen_repo.mark_page_exhausted(rand_page)
+        for page, required_ids in pending_exhausted.items():
+            if required_ids.issubset(successful_seen_ids):
+                seen_repo.mark_page_exhausted(page, filter_mode)
 
-        total_pages_calculated = last_page
+        if used_seen_fallback:
+            message = message or "已扫描全部候选页，未见图片不足，补充了部分已见图片。"
+        elif len(selected) < count and selected:
+            message = message or "符合当前过滤条件的图片不足，已返回全部可用图片。"
 
+        stats_debug = f"scanned_pages={len(pages_used)}"
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"从 Immich 获取资源失败: {exc}")
 
-    if not all_assets:
+    if not selected:
         return RandomResponse(
             assets=[],
             used_seen_fallback=False,
@@ -518,7 +701,7 @@ async def fetch_random_assets(
             seen_count=seen_repo.get_counter("seen_count"),
             deleted_total=seen_repo.get_counter("deleted_count"),
             favorited_total=seen_repo.get_counter("favorited_count"),
-            pages_used=None,
+            pages_used=list(dict.fromkeys(pages_used))[:100] or None,
             total_pages_considered=total_pages_calculated,
             total_assets=total_assets,
             stats_debug=stats_debug,
@@ -528,72 +711,8 @@ async def fetch_random_assets(
             round_filter=filter_mode,
         )
 
-    unique: dict[str, AssetItem] = {}
-    for a in all_assets:
-        unique[a.id] = a
-    all_assets = list(unique.values())
-    random.shuffle(all_assets)
-
-    excluded_ids: Set[str] = set()
-    if filter_mode == "exclude-prescreen":
-        try:
-            excluded_ids.update(await get_album_asset_ids_cached(SEEN_ALBUM_NAME))
-            excluded_ids.update(await get_album_asset_ids_cached(FAV_ALBUM_NAME))
-        except Exception:
-            pass
-    elif filter_mode == "exclude-albums":
-        try:
-            excluded_ids.update(await get_all_album_asset_ids_cached())
-        except Exception:
-            pass
-
-    filtered_assets = [a for a in all_assets if a.id not in excluded_ids]
-
-    if pages_used and not filtered_assets:
-        seen_repo.mark_page_exhausted(pages_used[0])
-
-    assets_pool = filtered_assets if filtered_assets else all_assets
-
-    selected: List[AssetItem] = []
-    used_seen_fallback = False
-    time_start = None
-    time_end = None
-
-    if len(assets_pool) >= count:
-        selected = random.sample(assets_pool, count)
-    else:
-        selected.extend(assets_pool)
-        remaining = count - len(selected)
-        remaining_pool = [a for a in all_assets if a.id not in {x.id for x in selected}]
-        if remaining_pool:
-            extras = random.sample(remaining_pool, min(remaining, len(remaining_pool)))
-            selected.extend(extras)
-            if extras:
-                used_seen_fallback = True
-
-    if not selected and all_assets:
-        selected = random.sample(all_assets, min(count, len(all_assets)))
-        used_seen_fallback = True
-        message = "全部已看，返回已看图片以填充。"
-
-    try:
-        if selected:
-            seen_album_id = await get_album_id_cached(SEEN_ALBUM_NAME, create_if_missing=True)
-            if seen_album_id:
-                await immich_client.add_assets_to_album(
-                    seen_album_id, [a.id for a in selected]
-                )
-                seen_repo.incr_counter("seen_count", len(selected))
-                cache_add_album_assets(SEEN_ALBUM_NAME, [a.id for a in selected])
-    except Exception:
-        pass
-
-    if not assets_pool:
-        message = message or "未见图片不足，补充了部分已见图片。"
-    elif used_seen_fallback:
-        message = message or "已无新的未见图片，使用部分已见图片填充。"
-
-    pages_used_dedup = list(dict.fromkeys(pages_used)) if pages_used else None
+    pages_used_dedup = list(dict.fromkeys(pages_used))[:100] if pages_used else None
+    time_end = datetime.now().isoformat()
 
     return RandomResponse(
         assets=selected,
@@ -642,14 +761,14 @@ async def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/random", response_model=RandomResponse)
+@serialized_operation
 async def api_random(
     count: int = Query(None),
     filter_mode: str = Query(DEFAULT_FILTER_MODE),
 ) -> RandomResponse:
     default_count, _, current_theme = load_ui_settings()
     target = count or default_count
-    if target <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(target)
     seen_repo.set_ui_settings(target, filter_mode, current_theme)
     if seen_repo.is_current_ready():
         snapshot = seen_repo.get_current_round()
@@ -689,18 +808,19 @@ async def api_random(
 
 
 @app.post("/api/refresh", response_model=RandomResponse)
+@serialized_operation
 async def api_refresh(
     count: int = Query(None),
     filter_mode: str = Query(DEFAULT_FILTER_MODE),
 ) -> RandomResponse:
     default_count, _, current_theme = load_ui_settings()
     target = count or default_count
-    if target <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(target)
     seen_repo.set_ui_settings(target, filter_mode, current_theme)
 
     snapshot = seen_repo.get_current_round() if seen_repo.is_current_ready() else None
-    if snapshot:
+    snapshot_filter = (snapshot or {}).get("filter_mode") or filter_mode
+    if snapshot and snapshot_filter != "all":
         ids = [item.get("id") for item in (snapshot.get("assets") or []) if item.get("id")]
         if ids:
             try:
@@ -730,8 +850,7 @@ async def api_ui_settings(payload: UISettingsRequest) -> dict:
     count = int(payload.count)
     filter_mode = payload.filter_mode or DEFAULT_FILTER_MODE
     theme = (payload.theme or DEFAULT_THEME).strip()
-    if count <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(count)
     if filter_mode not in {"all", "exclude-prescreen", "exclude-albums"}:
         raise HTTPException(status_code=400, detail="filter_mode æ æ")
     if theme not in THEME_OPTIONS:
@@ -741,24 +860,23 @@ async def api_ui_settings(payload: UISettingsRequest) -> dict:
 
 
 @app.post("/api/remember-forward")
+@serialized_operation
 async def api_remember_forward(payload: RoundSnapshotRequest) -> dict:
     count = int(payload.count)
     filter_mode = payload.filter_mode or DEFAULT_FILTER_MODE
-    if count <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(count)
     if filter_mode not in {"all", "exclude-prescreen", "exclude-albums"}:
         raise HTTPException(status_code=400, detail="filter_mode æ æ")
     payload_dict = build_round_snapshot(count, filter_mode, payload.assets)
-    seen_repo.set_forward_round(payload_dict)
-    seen_repo.set_forward_state(1)
+    seen_repo.set_forward_round(payload_dict, state=1)
     return {"success": True}
 
 @app.post("/api/remember-round")
+@serialized_operation
 async def api_remember_round(payload: RoundSnapshotRequest) -> dict:
     count = int(payload.count)
     filter_mode = payload.filter_mode or DEFAULT_FILTER_MODE
-    if count <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(count)
     if filter_mode not in {"all", "exclude-prescreen", "exclude-albums"}:
         raise HTTPException(status_code=400, detail="filter_mode æ æ")
     store_prev_round(count, filter_mode, payload.assets, True)
@@ -766,6 +884,7 @@ async def api_remember_round(payload: RoundSnapshotRequest) -> dict:
 
 
 @app.post("/api/delete", response_model=DeleteResponse)
+@serialized_operation
 async def api_delete(payload: DeleteRequest) -> DeleteResponse:
     if not payload.ids:
         return DeleteResponse(success=True, deleted=0, failed=[], detail="空列表，无需删除")
@@ -776,12 +895,18 @@ async def api_delete(payload: DeleteRequest) -> DeleteResponse:
         if isinstance(result, dict) and "failedIds" in result:
             failed_ids = result.get("failedIds") or []
             deleted_count = deleted_count - len(failed_ids)
+            if deleted_count:
+                _page_cache.clear()
+                seen_repo.clear_exhausted_pages()
             return DeleteResponse(
                 success=len(failed_ids) == 0,
                 deleted=deleted_count,
                 failed=failed_ids,
                 detail="部分删除失败" if failed_ids else None,
             )
+        if deleted_count:
+            _page_cache.clear()
+            seen_repo.clear_exhausted_pages()
         return DeleteResponse(success=True, deleted=deleted_count, failed=[], detail=detail_text)
     except HTTPException:
         raise
@@ -790,12 +915,12 @@ async def api_delete(payload: DeleteRequest) -> DeleteResponse:
 
 
 @app.post("/api/next", response_model=NextResponse)
+@serialized_operation
 async def api_next(payload: NextRequest) -> NextResponse:
     default_count, _, current_theme = load_ui_settings()
     count = payload.count or default_count
     filter_mode = payload.filter_mode or DEFAULT_FILTER_MODE
-    if count <= 0:
-        raise HTTPException(status_code=400, detail="count å¿é¡»å¤§äº 0")
+    validate_count(count)
     seen_repo.set_ui_settings(count, filter_mode, current_theme)
 
     forward_state = seen_repo.get_forward_state()
@@ -863,43 +988,54 @@ async def api_next(payload: NextRequest) -> NextResponse:
             snapshot_count_val, snapshot_filter, payload.current_assets, True
         )
 
-    deleted_count = 0
-    failed_delete: List[str] = []
-    album_added = 0
-    failed_album: List[str] = []
-    album_error: Optional[str] = None
-    target_album_name = FAV_ALBUM_NAME
-    target_album_id: Optional[str] = None
-
-    if payload.album_ids:
+    async def execute_album_action() -> Tuple[int, List[str], Optional[str], List[str]]:
+        if not payload.album_ids:
+            return 0, [], None, []
         try:
-            target_album_id = await get_album_id_cached(target_album_name, create_if_missing=True)
-            if target_album_id:
-                await immich_client.add_assets_to_album(target_album_id, payload.album_ids)
-                album_added = len(payload.album_ids)
-                if album_added:
-                    seen_repo.incr_counter("favorited_count", album_added)
-                    cache_add_album_assets(target_album_name, payload.album_ids)
-            else:
-                failed_album = payload.album_ids
-                album_error = "相册不可用"
+            album_id = await get_album_id_cached(
+                FAV_ALBUM_NAME, create_if_missing=True
+            )
+            if not album_id:
+                return 0, list(payload.album_ids), "相册不可用", []
+            failed, added = await immich_client.add_assets_to_album(
+                album_id, payload.album_ids
+            )
+            failed_set = set(failed)
+            successful = [
+                asset_id for asset_id in payload.album_ids if asset_id not in failed_set
+            ]
+            return len(set(added)), list(failed), None, successful
         except Exception as exc:
-            failed_album = payload.album_ids
-            album_error = str(exc)
+            return 0, list(payload.album_ids), str(exc), []
 
-    if payload.delete_ids:
+    async def execute_delete_action() -> Tuple[int, List[str], Optional[str]]:
+        if not payload.delete_ids:
+            return 0, [], None
         try:
             result = await immich_client.delete_assets(payload.delete_ids)
-            failed_ids = []
+            failed = []
             if isinstance(result, dict) and "failedIds" in result:
-                failed_ids = result.get("failedIds") or []
-            deleted_count = len(payload.delete_ids) - len(failed_ids)
-            failed_delete = failed_ids
-            if deleted_count > 0:
-                seen_repo.incr_counter("deleted_count", deleted_count)
+                failed = [str(item) for item in (result.get("failedIds") or [])]
+            failed_set = set(failed)
+            deleted = sum(1 for asset_id in payload.delete_ids if asset_id not in failed_set)
+            return deleted, failed, None
         except Exception as exc:
-            failed_delete = payload.delete_ids
-            album_error = album_error or str(exc)
+            return 0, list(payload.delete_ids), str(exc)
+
+    album_result, delete_result = await asyncio.gather(
+        execute_album_action(), execute_delete_action()
+    )
+    album_added, failed_album, album_error, successful_album_ids = album_result
+    deleted_count, failed_delete, delete_error = delete_result
+
+    if album_added:
+        seen_repo.incr_counter("favorited_count", album_added)
+        cache_add_album_assets(FAV_ALBUM_NAME, successful_album_ids)
+    if deleted_count:
+        seen_repo.incr_counter("deleted_count", deleted_count)
+        _page_cache.clear()
+        seen_repo.clear_exhausted_pages()
+    album_error = album_error or delete_error
 
     force_validate = seen_repo.get_meta("current_restored") == "1"
     if force_validate:
@@ -918,6 +1054,7 @@ async def api_next(payload: NextRequest) -> NextResponse:
 
 
 @app.get("/api/previous", response_model=RandomResponse)
+@serialized_operation
 async def api_previous() -> RandomResponse:
     if not seen_repo.is_prev_ready():
         raise HTTPException(status_code=404, detail="暂无上一轮记录")
@@ -946,6 +1083,8 @@ async def api_previous() -> RandomResponse:
             restored_count, failed_ids = await immich_client.restore_assets(restore_ids)
             if restored_count:
                 adjust_counter("deleted_count", -restored_count)
+                _page_cache.clear()
+                seen_repo.clear_exhausted_pages()
         except Exception:
             pass
 
@@ -989,6 +1128,7 @@ async def api_previous() -> RandomResponse:
 
 
 @app.post("/api/reset-seen")
+@serialized_operation
 async def api_reset_seen() -> dict:
     # Delete seen album (do not delete assets) and reset local counters
     try:

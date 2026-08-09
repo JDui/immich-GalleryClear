@@ -201,7 +201,11 @@ class ImmichClient:
         return None, None
 
     async def search_assets(
-        self, page: int = 1, size: int = 200, skip_override: Optional[int] = None
+        self,
+        page: int = 1,
+        size: int = 200,
+        skip_override: Optional[int] = None,
+        album_ids: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
         """
         Use the documented searchMetadata endpoint to fetch assets.
@@ -217,6 +221,8 @@ class ImmichClient:
             "isArchived": False,
             "isTrashed": False,
         }
+        if album_ids:
+            body["albumIds"] = album_ids
         response = await self._request("POST", "/api/search/metadata", json=body)
         data = response.json()
 
@@ -237,6 +243,11 @@ class ImmichClient:
             )
 
         if isinstance(items_field, dict):
+            if total_count is None:
+                for key in ("totalCount", "total", "count"):
+                    if items_field.get(key) is not None:
+                        total_count = items_field.get(key)
+                        break
             nested = (
                 items_field.get("items")
                 or items_field.get("assets")
@@ -259,9 +270,6 @@ class ImmichClient:
             total_count = int(total_count) if total_count is not None else None
         except Exception:
             total_count = None
-        if total_count is None:
-            total_count = len(normalized) if normalized else None
-
         return normalized, total_count
 
     async def delete_assets(self, ids: List[str]) -> Dict[str, Any]:
@@ -313,19 +321,12 @@ class ImmichClient:
         Create if missing.
         Reference: https://api.immich.app/endpoints/albums/createAlbum
         """
-        # Try to list albums and find by name
-        try:
-            r = await self._request("GET", "/api/albums")
-            data = r.json()
-            if isinstance(data, list):
-                garbled_id: Optional[str] = None
-                for album in data:
-                    if not isinstance(album, dict):
-                        continue
-                    if album.get("albumName") == name:
-                        return album.get("id")
-        except Exception:
-            pass
+        # Only create after a successful list. Treating a transient list failure as
+        # "not found" can create duplicate tracking albums.
+        albums = await self.list_albums()
+        for album in albums:
+            if album.get("albumName") == name and album.get("id"):
+                return str(album["id"])
 
         # Create
         body = {"albumName": name, "assetIds": []}
@@ -336,13 +337,15 @@ class ImmichClient:
             raise RuntimeError("Failed to create album")
         return album_id
 
-    async def add_assets_to_album(self, album_id: str, ids: List[str]) -> None:
+    async def add_assets_to_album(
+        self, album_id: str, ids: List[str]
+    ) -> Tuple[List[str], List[str]]:
         """
         Add assets to album.
         Reference: https://api.immich.app/endpoints/albums/addAssetsToAlbum
         """
         if not ids:
-            return
+            return [], []
         body = {"ids": ids}
         paths = [
             f"/api/albums/{album_id}/assets",
@@ -351,9 +354,41 @@ class ImmichClient:
         ]
         for path in paths:
             try:
-                await self._request("PUT", path, json=body)
-                return
-            except Exception:
+                response = await self._request("PUT", path, json=body)
+                try:
+                    data = response.json() if response.content else {}
+                except Exception:
+                    data = {}
+                if isinstance(data, dict):
+                    failed = (
+                        data.get("failedIds")
+                        or data.get("failedAssetIds")
+                        or data.get("failed")
+                        or []
+                    )
+                    failed_ids = [str(x) for x in failed]
+                    failed_set = set(failed_ids)
+                    added_ids = [asset_id for asset_id in ids if asset_id not in failed_set]
+                    return failed_ids, added_ids
+                if isinstance(data, list):
+                    failed_ids: List[str] = []
+                    added_ids: List[str] = []
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        asset_id = item.get("id") or item.get("assetId")
+                        if not asset_id:
+                            continue
+                        asset_id = str(asset_id)
+                        if item.get("success") is True:
+                            added_ids.append(asset_id)
+                        elif str(item.get("error") or "").lower() != "duplicate":
+                            failed_ids.append(asset_id)
+                    return failed_ids, added_ids
+                return [], list(ids)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code not in {404, 405}:
+                    raise
                 continue
         raise RuntimeError("Failed to add assets to album")
 
@@ -393,7 +428,7 @@ class ImmichClient:
         data = response.json()
         if isinstance(data, list):
             return [a for a in data if isinstance(a, dict)]
-        return []
+        raise RuntimeError("Unexpected album list response from Immich")
 
     async def find_album_by_name(self, name: str) -> Optional[str]:
         albums = await self.list_albums()
@@ -453,10 +488,14 @@ class ImmichClient:
         Get asset ids in an album.
         """
         paths = [f"/api/albums/{album_id}", f"/api/album/{album_id}"]
+        last_error: Optional[Exception] = None
         for path in paths:
             try:
                 resp = await self._request("GET", path)
                 data = resp.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError("Unexpected album response from Immich")
+                has_embedded_assets = "assets" in data or "albumAssets" in data
                 items = data.get("assets") or data.get("albumAssets") or []
                 ids: List[str] = []
                 for it in items:
@@ -465,22 +504,60 @@ class ImmichClient:
                     aid = it.get("id") or (it.get("asset") or {}).get("id")
                     if aid:
                         ids.append(str(aid))
-                return ids
-            except Exception:
+                if has_embedded_assets or int(data.get("assetCount") or 0) == 0:
+                    return ids
+                return await self._search_album_asset_ids(album_id)
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response is not None and exc.response.status_code not in {404, 405}:
+                    raise
                 continue
-        return []
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Unable to list assets for album {album_id}")
+
+    async def _search_album_asset_ids(self, album_id: str) -> List[str]:
+        """Compatibility path for Immich versions that omit assets from album DTOs."""
+        page = 1
+        page_size = 200
+        ids: List[str] = []
+        seen_ids = set()
+        while page <= 1_048_576:
+            items, total = await self.search_assets(
+                page=page,
+                size=page_size,
+                album_ids=[album_id],
+            )
+            for item in items:
+                asset_id = item.get("id") or item.get("assetId")
+                if asset_id and str(asset_id) not in seen_ids:
+                    seen_ids.add(str(asset_id))
+                    ids.append(str(asset_id))
+            if not items or len(items) < page_size:
+                return ids
+            if total is not None and len(ids) >= total:
+                return ids
+            page += 1
+        raise RuntimeError(f"Album pagination exceeded safety limit for {album_id}")
 
     async def list_all_album_asset_ids(self) -> List[str]:
-        ids: List[str] = []
         albums = await self.list_albums()
-        for alb in albums:
-            aid = alb.get("id")
-            if not aid:
-                continue
-            try:
-                ids.extend(await self.list_album_asset_ids(aid))
-            except Exception:
-                continue
+        album_ids = [str(album["id"]) for album in albums if album.get("id")]
+        results = await asyncio.gather(
+            *(self.list_album_asset_ids(album_id) for album_id in album_ids),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise RuntimeError(
+                f"Failed to read {len(failures)} of {len(album_ids)} albums: {failures[0]}"
+            )
+        ids: List[str] = []
+        for result in results:
+            ids.extend(result)
         return ids
 
     async def list_assets(self, skip: int = 0, take: int = 500) -> List[Dict[str, Any]]:
