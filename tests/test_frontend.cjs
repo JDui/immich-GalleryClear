@@ -5,10 +5,22 @@ const path = require("node:path");
 
 // Load functions without booting the page or making network requests.
 const source = fs.readFileSync(path.join(__dirname, "../app/static/js/main.js"), "utf8");
-const grid = { clientWidth: 780 };
+const gridClasses = new Set();
+const grid = {
+  clientWidth: 780,
+  classList: {
+    add: (name) => gridClasses.add(name),
+    remove: (name) => gridClasses.delete(name),
+  },
+};
+const toastNodes = [];
 const context = vm.createContext({
   window: { innerWidth: 800, innerHeight: 800 },
-  document: { getElementById: (id) => id === "grid" ? grid : null },
+  document: {
+    getElementById: (id) => id === "grid" ? grid :
+      id === "toast-container" ? { appendChild: (node) => toastNodes.push(node) } : null,
+    createElement: () => ({ style: {}, remove() {} }),
+  },
   getComputedStyle: () => ({ gap: "10px" }),
   setTimeout: (fn) => { timers.push(fn); return timers.length; },
   clearTimeout: () => {},
@@ -57,4 +69,30 @@ listeners.touchstart(event("touchstart", [touch(50), touch(150)]));
 listeners.touchmove(event("touchmove", [touch(0), touch(250)]));
 listeners.touchcancel(event("touchcancel", []));
 assert.equal(img.style.transform, "", "Cancelled gestures must also restore the image");
-console.log("Square layout and touch zoom checks passed");
+
+context.toast("Background processing");
+context.toast("Done", "success");
+assert.equal(toastNodes.length, 0, "Normal operations must stay quiet");
+context.toast("Failed", "error");
+assert.equal(toastNodes.length, 1, "Errors must still be shown");
+
+const frames = [];
+context.requestAnimationFrame = (fn) => frames.push(fn);
+classes.add("delete-out");
+classes.delete("img-loaded");
+card.isConnected = true;
+card.appendChild = (node) => { node.isConnected = true; };
+context.revealCardImage(card, img, { isConnected: false });
+assert.equal(classes.has("img-loaded"), false);
+frames.shift()();
+assert.equal(classes.has("img-loaded"), false, "Cached images need a transparent paint first");
+frames.shift()();
+assert.equal(classes.has("img-loaded"), true);
+assert.equal(classes.has("delete-out"), true, "Late loads must never restart an exiting card");
+gridClasses.add("round-leaving");
+context.revealGrid();
+frames.shift()();
+assert.equal(gridClasses.has("round-leaving"), true);
+frames.shift()();
+assert.equal(gridClasses.has("round-leaving"), false);
+console.log("Layout, touch zoom, error-only notifications and fade handoff checks passed");

@@ -147,6 +147,7 @@ function createShatterLayer(card) {
 async function wipeOutGrid(mode = "normal") {
   const cards = [...gridEl.querySelectorAll(".card")];
   if (!cards.length) return;
+  gridEl.classList.add("round-leaving");
   let delay = 450;
   cards.forEach((card) => {
     if (mode === "special") {
@@ -165,6 +166,18 @@ async function wipeOutGrid(mode = "normal") {
     applyWipeOut(card);
   });
   await sleep(delay);
+}
+
+function revealGrid() {
+  // Allow the browser to paint the new layout at zero opacity before fading in.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    gridEl.classList.remove("round-leaving");
+  }));
+}
+
+function restoreGrid() {
+  gridEl.querySelectorAll(".card").forEach(clearWipeClasses);
+  revealGrid();
 }
 
 function filterModeLabel(mode) {
@@ -293,6 +306,7 @@ function applyGridLayout() {
 }
 
 function toast(message, type = "success", timeout = 2400) {
+  if (type !== "error") return;
   const div = document.createElement("div");
   div.className = `toast ${type}`;
   div.textContent = message;
@@ -313,11 +327,14 @@ function updateStatus(text) {
 function showMissingPlaceholder(card, label = "资源不可用") {
   if (card.querySelector(".missing-placeholder")) return;
   const sands = card.querySelectorAll(".sand-placeholder, .gif-placeholder");
-  sands.forEach((node) => node.remove());
+  sands.forEach(fadeOutSand);
   const placeholder = document.createElement("div");
   placeholder.className = "missing-placeholder";
   placeholder.textContent = label;
   card.appendChild(placeholder);
+  requestAnimationFrame(() => {
+    if (placeholder.isConnected) placeholder.classList.add("visible");
+  });
   const img = card.querySelector("img");
   if (img) {
     img.style.opacity = "0";
@@ -343,6 +360,18 @@ function fadeOutSand(placeholder) {
       placeholder.remove();
     }
   }, 900);
+}
+
+function revealCardImage(card, img, placeholder) {
+  if (!card.isConnected) return;
+  if (!img.isConnected) card.appendChild(img);
+  // Cached images and GIFs must also have an initial transparent paint.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (!card.isConnected) return;
+    card.classList.remove("gif-loading");
+    card.classList.add("img-loaded");
+    fadeOutSand(placeholder);
+  }));
 }
 
 function applyMarkVisual(card, badge, state) {
@@ -516,6 +545,7 @@ function attachPinchZoom(card, img) {
 }
 
 function renderGrid(list) {
+  gridEl.classList.add("round-leaving");
   gridEl.innerHTML = "";
   markState = {};
   updateBlurBackground(list);
@@ -527,6 +557,7 @@ function renderGrid(list) {
     const card = document.createElement("div");
     card.className = "card";
     card.dataset.id = item.id;
+    applyWipeIn(card);
 
     const img = document.createElement("img");
     const isGif =
@@ -547,7 +578,7 @@ function renderGrid(list) {
     const sand = createSandPlaceholder(isGif ? "GIF 加载中" : "加载中");
     card.appendChild(sand);
     requestAnimationFrame(() => {
-      if (sand.isConnected) {
+      if (sand.isConnected && !sand.classList.contains("fade-out")) {
         sand.classList.add("visible");
       }
     });
@@ -568,15 +599,7 @@ function renderGrid(list) {
         const done = () => resolve(true);
         const showImage = () => {
           if (!card.isConnected) return done();
-          card.classList.remove("gif-loading");
-          fadeOutSand(placeholder);
-          applyWipeIn(card);
-          card.classList.add("img-loaded");
-          if (meta.isConnected) {
-            card.insertBefore(img, meta);
-          } else {
-            card.appendChild(img);
-          }
+          revealCardImage(card, img, placeholder);
           done();
         };
         const fallbackToThumb = () => {
@@ -626,14 +649,7 @@ function renderGrid(list) {
           "load",
           () => {
             if (!card.isConnected) return done();
-            fadeOutSand(sand);
-            applyWipeIn(card);
-            card.classList.add("img-loaded");
-            if (meta.isConnected) {
-              card.insertBefore(img, meta);
-            } else {
-              card.appendChild(img);
-            }
+            revealCardImage(card, img, sand);
             done();
           },
           { once: true }
@@ -641,7 +657,6 @@ function renderGrid(list) {
         img.addEventListener(
           "error",
           () => {
-            sand.remove();
             showMissingPlaceholder(card);
             done();
           },
@@ -743,9 +758,8 @@ function renderGrid(list) {
     gridEl.appendChild(card);
   });
 
-  requestAnimationFrame(() => {
-    applyGridLayout();
-  });
+  applyGridLayout();
+  revealGrid();
   return Promise.allSettled(loadPromises);
 }
 
@@ -783,9 +797,9 @@ async function loadRandom() {
     const data = await fetchJSON(
       `/api/random?count=${currentCount}&filter_mode=${currentFilter}`
     );
+    await wipePromise;
     applyRoundSettings(data);
     assets = data.assets || [];
-    await wipePromise;
     renderGrid(assets);
     updatePrevButtonState(data);
     const info = [
@@ -800,11 +814,9 @@ async function loadRandom() {
     }
     if (data.message) info.push(data.message);
     updateStatus(info.join(" · "));
-    if (data.used_seen_fallback) {
-      toast("未见图片不足，包含部分已看图片", "error", 3000);
-    }
     renderDebugRange(data);
   } catch (err) {
+    restoreGrid();
     updateStatus("加载失败");
     toast(`加载失败：${err.message}`, "error");
   }
@@ -818,9 +830,9 @@ async function refreshRound() {
       `/api/refresh?count=${currentCount}&filter_mode=${currentFilter}`,
       { method: "POST" }
     );
+    await wipePromise;
     applyRoundSettings(data);
     assets = data.assets || [];
-    await wipePromise;
     renderGrid(assets);
     updatePrevButtonState(data);
     const info = [
@@ -837,6 +849,7 @@ async function refreshRound() {
     updateStatus(info.join(" · "));
     renderDebugRange(data);
   } catch (err) {
+    restoreGrid();
     updateStatus("刷新失败");
     toast(`刷新失败：${err.message}`, "error");
   }
@@ -846,7 +859,6 @@ async function resetSeen() {
   if (!confirm("确定要清空已看记录吗？")) return;
   try {
     await fetchJSON("/api/reset-seen", { method: "POST" });
-    toast("已重置已看记录");
     await loadRandom();
   } catch (err) {
     toast(`重置失败：${err.message}`, "error");
@@ -883,9 +895,9 @@ async function nextStep() {
         current_assets: snapshotAssets,
       }),
     });
+    await wipePromise;
     applyRoundSettings(data);
     assets = data.assets || [];
-    await wipePromise;
     renderGrid(assets);
     updatePrevButtonState(data);
     const info = [
@@ -902,10 +914,10 @@ async function nextStep() {
     if (data.failed_delete?.length) toast(`删除失败 ${data.failed_delete.length} 张`, "error");
     if (data.failed_album?.length) toast(`加入相册失败 ${data.failed_album.length} 张`, "error");
     if (data.action_job_id) {
-      toast("本轮标记已提交，后台处理中");
       watchActionJob(data.action_job_id);
     }
   } catch (err) {
+    restoreGrid();
     toast(`操作失败：${err.message}`, "error");
   } finally {
     endLoading(btnNext, startTime, ripplePromise, false);
@@ -921,9 +933,6 @@ async function watchActionJob(jobId) {
       if (result.failed_delete?.length) toast(`后台删除失败 ${result.failed_delete.length} 张，请检查调试日志`, "error", 6000);
       if (result.failed_album?.length) toast(`后台收藏失败 ${result.failed_album.length} 张，请检查调试日志`, "error", 6000);
       if (result.error) toast(`后台处理异常：${result.error}`, "error", 6000);
-      if (!result.error && !result.failed_delete?.length && !result.failed_album?.length) {
-        toast(`后台完成：删除 ${result.deleted || 0} 张，收藏 ${result.album_added || 0} 张`);
-      }
       return;
     }
   } catch (err) {
@@ -944,9 +953,9 @@ async function loadPrevious() {
   let finalDisabled = false;
   try {
     const data = await fetchJSON("/api/previous");
+    await wipePromise;
     applyRoundSettings(data);
     assets = data.assets || [];
-    await wipePromise;
     renderGrid(assets);
     updatePrevButtonState(data);
     finalDisabled = btnPrev.disabled;
@@ -960,6 +969,7 @@ async function loadPrevious() {
     updateStatus(info.join(" · "));
     renderDebugRange(data);
   } catch (err) {
+    restoreGrid();
     toast(`返回上一轮失败：${err.message}`, "error");
   } finally {
     endLoading(btnPrev, startTime, ripplePromise, finalDisabled);

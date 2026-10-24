@@ -530,6 +530,13 @@ body.theme-blur::before {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(var(--grid-cols, 3), minmax(0, 1fr));
+  opacity: 1;
+  transition: opacity 0.45s ease-in-out;
+}
+
+.grid.round-leaving {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .card {
@@ -618,7 +625,6 @@ body.theme-blur::before {
 
 .sand-placeholder.visible {
   opacity: 0.55;
-  animation: sand-flow 2.6s ease-in-out infinite, sand-fade-in 0.9s ease forwards;
 }
 
 .sand-placeholder.fade-out {
@@ -635,6 +641,12 @@ body.theme-blur::before {
   font-size: 12px;
   font-weight: 700;
   color: rgba(30, 41, 59, 0.9);
+  opacity: 0;
+  transition: opacity 0.45s ease;
+}
+
+.missing-placeholder.visible {
+  opacity: 1;
   background-color: #e5e7eb;
   background-image:
     linear-gradient(45deg, rgba(203, 213, 225, 0.7) 25%, transparent 25%),
