@@ -8,6 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, "../app/static/js/main.js"),
 const gridClasses = new Set();
 const grid = {
   clientWidth: 780,
+  clientHeight: 620,
   classList: {
     add: (name) => gridClasses.add(name),
     remove: (name) => gridClasses.delete(name),
@@ -28,12 +29,16 @@ const context = vm.createContext({
 const timers = [];
 vm.runInContext(source.slice(0, source.indexOf('document.getElementById("btn-refresh").addEventListener')), context);
 
-for (const [width, height] of [[720, 720], [850, 650], [1200, 1100]]) {
-  context.window.innerWidth = width;
-  context.window.innerHeight = height;
-  assert.equal(context.computeGridColumns(6), 2);
-  assert.equal(context.computeGridColumns(1), 1);
-}
+grid.clientWidth = 360;
+grid.clientHeight = 480;
+assert.equal(context.computeGridColumns(6), 2, "Portrait phones should fit six cards in two columns");
+grid.clientWidth = 1360;
+grid.clientHeight = 580;
+assert.equal(context.computeGridColumns(6), 3, "Wide galleries should use the available width");
+grid.clientWidth = 780;
+grid.clientHeight = 620;
+assert.equal(context.computeGridColumns(1), 1);
+assert.ok(context.computeGridColumns(25) > context.computeGridColumns(6), "Dense batches need more columns");
 
 const listeners = {};
 const classes = new Set();

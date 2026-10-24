@@ -250,31 +250,27 @@ function applyTheme(theme) {
 
 function computeGridColumns(count) {
   const gridWidth = gridEl.clientWidth || (gridEl.parentElement ? gridEl.parentElement.clientWidth : 0) || window.innerWidth;
-  const gap = parseFloat(getComputedStyle(gridEl).gap) || 10;
-  const viewportWidth = window.visualViewport?.width || window.innerWidth;
-  const viewportHeight = window.visualViewport?.height || window.innerHeight || 1;
-  const aspect = viewportWidth / Math.max(1, viewportHeight);
-  if (aspect >= 0.95 && aspect <= 1.5) {
-    return Math.max(1, Math.min(count, 2));
+  const gridHeight = gridEl.clientHeight || window.innerHeight || 1;
+  const gap = parseFloat(getComputedStyle(gridEl).gap) || 8;
+  // Fit both dimensions, while keeping dense batches large enough to review.
+  const minCardWidth = gridWidth <= 600 ? 100 : 140;
+  const maxCols = Math.max(1, Math.min(count, Math.floor((gridWidth + gap) / (minCardWidth + gap))));
+  const targetAspect = gridWidth <= 600 ? 1 : 4 / 3;
+  let bestCols = 1;
+  let bestScore = Infinity;
+  for (let cols = 1; cols <= maxCols; cols += 1) {
+    const rows = Math.ceil(count / cols);
+    const width = (gridWidth - gap * (cols - 1)) / cols;
+    const height = Math.max(76, (gridHeight - gap * (rows - 1)) / rows);
+    const emptyFraction = (cols * rows - count) / count;
+    const overflow = Math.max(0, (rows * 76 + gap * (rows - 1) - gridHeight) / gridHeight);
+    const score = Math.abs(Math.log(width / height / targetAspect)) + emptyFraction * 0.8 + overflow;
+    if (score < bestScore) {
+      bestScore = score;
+      bestCols = cols;
+    }
   }
-  let minCardWidth = 300;
-  if (viewportWidth <= 480) {
-    // Narrow phones work best as a compact two-column review surface.
-    minCardWidth = 132;
-  } else if (viewportWidth <= 900) {
-    minCardWidth = 210;
-  } else if (aspect >= 4 / 3) {
-    minCardWidth = 250;
-  } else if (aspect >= 1.1) {
-    minCardWidth = 280;
-  }
-  const maxColsByWidth = Math.max(1, Math.floor((gridWidth + gap) / (minCardWidth + gap)));
-  let maxColsByCount = 3;
-  if (count < 10) maxColsByCount = 3;
-  else if (count < 25) maxColsByCount = 4;
-  else if (count < 36) maxColsByCount = 5;
-  else maxColsByCount = 6;
-  return Math.max(1, Math.min(count, maxColsByWidth, maxColsByCount));
+  return bestCols;
 }
 
 function applyOrphanCentering(count, cols) {
@@ -299,10 +295,12 @@ function applyOrphanCentering(count, cols) {
 }
 
 function applyGridLayout() {
-  const cols = computeGridColumns(currentCount);
+  const count = gridEl.children.length || currentCount;
+  const cols = computeGridColumns(count);
   currentColumns = cols;
   gridEl.style.setProperty("--grid-cols", String(cols));
-  applyOrphanCentering(currentCount, cols);
+  gridEl.style.setProperty("--grid-rows", String(Math.ceil(count / cols)));
+  applyOrphanCentering(count, cols);
 }
 
 function toast(message, type = "success", timeout = 2400) {
@@ -759,6 +757,7 @@ function renderGrid(list) {
   });
 
   applyGridLayout();
+  gridEl.parentElement.scrollTop = 0;
   revealGrid();
   return Promise.allSettled(loadPromises);
 }
@@ -1220,4 +1219,8 @@ renderDebugConfig();
 window.addEventListener("resize", () => {
   applyGridLayout();
 });
+// Header wrapping and status messages can change the available gallery height.
+if (typeof ResizeObserver !== "undefined") {
+  new ResizeObserver(() => applyGridLayout()).observe(gridEl);
+}
 loadRandom();

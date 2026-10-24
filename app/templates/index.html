@@ -21,7 +21,7 @@
         <button id="btn-prev" class="primary small prev-button" disabled>返回上一轮</button>
         <button id="btn-refresh" class="secondary small subtle">重新抽一组</button>
         <button id="btn-reset" class="secondary small subtle">重置已看记录</button>
-        <select id="theme-select" class="secondary small">
+        <select id="theme-select" class="secondary small" aria-label="背景主题">
           <option value="rainbow">流动彩虹</option>
           <option value="gradient">纯色渐变</option>
           <option value="blur">模糊首图</option>
@@ -37,7 +37,7 @@
     <section class="controls bottom-controls">
       <div class="action-row">
         <div class="control-group left">
-          <select id="grid-preset" class="secondary">
+          <select id="grid-preset" class="secondary" aria-label="每轮图片数量">
             <option value="3">3</option>
             <option value="4">4</option>
             <option value="6" selected>6</option>
@@ -47,13 +47,13 @@
             <option value="custom">自定义</option>
           </select>
           <div id="grid-custom" class="grid-custom hidden">
-            <input type="number" id="grid-count" class="small-input" min="1" max="99" placeholder="数量" />
+            <input type="number" id="grid-count" class="small-input" min="1" max="99" placeholder="数量" aria-label="自定义图片数量" />
             <button id="grid-apply" class="secondary small">应用</button>
           </div>
         </div>
         <button id="btn-next" class="primary">下一轮（执行标记）</button>
         <div class="control-group right">
-          <select id="filter-mode" class="secondary">
+          <select id="filter-mode" class="secondary" aria-label="图片过滤方式">
             <option value="all">所有图片</option>
             <option value="exclude-prescreen" selected>预筛过图片除外</option>
             <option value="exclude-albums">所有相册照片除外</option>
@@ -64,7 +64,10 @@
     </section>
 
     <footer class="footer">
-      <div class="hint">提示：数量和图片过滤在下一轮生效。可选数量：3 / 4 / 6（默认） / 9 / 12 / 25 或自定义。点击切换删除/收藏/无标记；鼠标滚轮在图片上可放大预览（三档：1.5x / 2x / 3x）。</div>
+      <details>
+        <summary>操作提示</summary>
+        <div class="hint">数量和图片过滤在下一轮生效。点击图片切换删除 / 收藏 / 无标记；鼠标滚轮可放大预览（1.5x / 2x / 3x），触屏可双指缩放。</div>
+      </details>
     </footer>
   </div>
 
