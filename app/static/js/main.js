@@ -147,18 +147,18 @@ function createShatterLayer(card) {
 async function wipeOutGrid(mode = "normal") {
   const cards = [...gridEl.querySelectorAll(".card")];
   if (!cards.length) return;
-  let delay = 260;
+  let delay = 450;
   cards.forEach((card) => {
     if (mode === "special") {
       const state = markState[card.dataset.id] || "none";
       if (state === "delete") {
         applyShatterOut(card);
-        delay = Math.max(delay, 520);
+        delay = Math.max(delay, 550);
         return;
       }
       if (state === "album") {
         applyFavOut(card);
-        delay = Math.max(delay, 520);
+        delay = Math.max(delay, 550);
         return;
       }
     }
@@ -241,13 +241,13 @@ function computeGridColumns(count) {
   const viewportWidth = window.visualViewport?.width || window.innerWidth;
   const viewportHeight = window.visualViewport?.height || window.innerHeight || 1;
   const aspect = viewportWidth / Math.max(1, viewportHeight);
+  if (aspect >= 0.95 && aspect <= 1.5) {
+    return Math.max(1, Math.min(count, 2));
+  }
   let minCardWidth = 300;
   if (viewportWidth <= 480) {
     // Narrow phones work best as a compact two-column review surface.
     minCardWidth = 132;
-  } else if (viewportWidth <= 900 && aspect >= 0.95 && aspect <= 1.5) {
-    // Foldable and tablet-like square screens can comfortably show three columns.
-    minCardWidth = 170;
   } else if (viewportWidth <= 900) {
     minCardWidth = 210;
   } else if (aspect >= 4 / 3) {
@@ -457,6 +457,64 @@ function endLoading(btn, startTime, ripplePromise, finalDisabled = false) {
   });
 }
 
+function attachPinchZoom(card, img) {
+  let startDistance = 0;
+  let pinching = false;
+  let suppressClick = false;
+  let releaseTimer;
+  let clickTimer;
+  const distance = (touches) => Math.hypot(
+    touches[0].clientX - touches[1].clientX,
+    touches[0].clientY - touches[1].clientY
+  );
+  card.addEventListener("touchstart", (event) => {
+    if (event.touches.length !== 2 ||
+        ![...event.touches].every((touch) => card.contains(touch.target))) return;
+    event.preventDefault();
+    clearTimeout(releaseTimer);
+    clearTimeout(clickTimer);
+    pinching = true;
+    suppressClick = true;
+    startDistance = Math.max(1, distance(event.touches));
+    const rect = img.getBoundingClientRect();
+    const x = (event.touches[0].clientX + event.touches[1].clientX) / 2;
+    const y = (event.touches[0].clientY + event.touches[1].clientY) / 2;
+    card.classList.remove("zoomed-150", "zoomed-200", "zoomed-300");
+    card.dataset.scale = "1";
+    img.style.transformOrigin = `${((x - rect.left) / rect.width) * 100}% ${((y - rect.top) / rect.height) * 100}%`;
+    card.classList.add("pinching");
+  }, { passive: false });
+  card.addEventListener("touchmove", (event) => {
+    if (!pinching) return;
+    event.preventDefault();
+    if (event.touches.length !== 2) return;
+    const scale = Math.max(1, Math.min(4, distance(event.touches) / startDistance));
+    img.style.transform = `scale(${scale})`;
+  }, { passive: false });
+  const release = (event) => {
+    if (pinching && (event.touches.length !== 2 || event.type === "touchcancel")) {
+      pinching = false;
+      card.classList.remove("pinching");
+      img.style.transform = "";
+      // Preserve the pinch origin until the return transition has finished.
+      releaseTimer = setTimeout(() => {
+        img.style.transformOrigin = "";
+      }, 360);
+    }
+    if (suppressClick && !event.touches.length) {
+      event.preventDefault();
+      clickTimer = setTimeout(() => { suppressClick = false; }, 400);
+    }
+  };
+  card.addEventListener("touchend", release, { passive: false });
+  card.addEventListener("touchcancel", release, { passive: false });
+  card.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+}
+
 function renderGrid(list) {
   gridEl.innerHTML = "";
   markState = {};
@@ -597,6 +655,7 @@ function renderGrid(list) {
     card.appendChild(meta);
     applyMarkVisual(card, badge, initialMark);
 
+    attachPinchZoom(card, img);
     card.addEventListener("click", () => {
       const current = markState[item.id];
       let next = "delete";
@@ -795,6 +854,7 @@ async function resetSeen() {
 }
 
 async function nextStep() {
+  if (btnNext.disabled) return;
   const deleteIds = [];
   const albumIds = [];
   Object.entries(markState).forEach(([id, state]) => {
@@ -809,6 +869,7 @@ async function nextStep() {
   scrollToTopAccelerate(900);
   const startTime = Date.now();
   try {
+    await wipePromise;
     const data = await fetchJSON("/api/next", {
       method: "POST",
       body: JSON.stringify({
@@ -840,10 +901,33 @@ async function nextStep() {
     updateStatus(info.join(" · "));
     if (data.failed_delete?.length) toast(`删除失败 ${data.failed_delete.length} 张`, "error");
     if (data.failed_album?.length) toast(`加入相册失败 ${data.failed_album.length} 张`, "error");
+    if (data.action_job_id) {
+      toast("本轮标记已提交，后台处理中");
+      watchActionJob(data.action_job_id);
+    }
   } catch (err) {
     toast(`操作失败：${err.message}`, "error");
   } finally {
     endLoading(btnNext, startTime, ripplePromise, false);
+  }
+}
+
+async function watchActionJob(jobId) {
+  try {
+    while (true) {
+      await sleep(1500);
+      const result = await fetchJSON(`/api/action-jobs/${jobId}`);
+      if (!result.done) continue;
+      if (result.failed_delete?.length) toast(`后台删除失败 ${result.failed_delete.length} 张，请检查调试日志`, "error", 6000);
+      if (result.failed_album?.length) toast(`后台收藏失败 ${result.failed_album.length} 张，请检查调试日志`, "error", 6000);
+      if (result.error) toast(`后台处理异常：${result.error}`, "error", 6000);
+      if (!result.error && !result.failed_delete?.length && !result.failed_album?.length) {
+        toast(`后台完成：删除 ${result.deleted || 0} 张，收藏 ${result.album_added || 0} 张`);
+      }
+      return;
+    }
+  } catch (err) {
+    toast(`后台结果查询失败，请检查调试日志：${err.message}`, "error", 6000);
   }
 }
 

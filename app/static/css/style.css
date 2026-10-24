@@ -533,6 +533,7 @@ body.theme-blur::before {
 }
 
 .card {
+  touch-action: pan-y;
   position: relative;
   background: linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(244, 246, 252, 0.08));
   border-radius: 12px;
@@ -915,6 +916,11 @@ body.theme-blur::before {
   transform: scale(1.5);
   filter: drop-shadow(0 12px 20px rgba(0, 0, 0, 0.18));
 }
+
+.card.pinching img {
+  transition: none;
+  will-change: transform;
+}
 .card.zoomed-150::before,
 .card.zoomed-200::before,
 .card.zoomed-300::before {
@@ -1252,7 +1258,7 @@ body.theme-blur::before {
   }
 }
 
-/* Near-square foldable screens: three compact columns and shallower cards. */
+/* Near-square foldable screens use two columns and shallower cards. */
 @media (min-width: 560px) and (max-width: 900px) and (min-aspect-ratio: 1/1) and (max-aspect-ratio: 3/2) {
   .page {
     padding-top: 4px;

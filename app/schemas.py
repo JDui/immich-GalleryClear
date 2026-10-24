@@ -67,6 +67,7 @@ class NextRequest(BaseModel):
 
 
 class NextResponse(RandomResponse):
+    action_job_id: Optional[str] = None
     deleted: int = 0
     album_added: int = 0
     failed_delete: List[str] = []

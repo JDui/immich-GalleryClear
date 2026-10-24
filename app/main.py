@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from uuid import uuid4
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -224,6 +225,13 @@ app = FastAPI(title="Immich Random Cleaner", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 _operation_lock = asyncio.Lock()
+_action_jobs: dict[str, dict] = {}
+_action_tasks: set[asyncio.Task] = set()
+
+
+async def wait_for_actions() -> None:
+    if _action_tasks:
+        await asyncio.gather(*(asyncio.shield(task) for task in list(_action_tasks)))
 
 
 def serialized_operation(func):
@@ -403,8 +411,14 @@ async def fetch_random_assets(
     count: int,
     filter_mode: str = "all",
     force_validate_pages: bool = False,
+    omit_ids: Optional[Set[str]] = None,
 ) -> RandomResponse:
     validate_count(count)
+    # Pending mutations must never reappear, even in the seen-image fallback.
+    omit_ids = set(omit_ids or ())
+    for job in _action_jobs.values():
+        if not job["done"]:
+            omit_ids.update(job["ids"])
     if filter_mode not in {"all", "exclude-prescreen", "exclude-albums"}:
         raise HTTPException(status_code=400, detail="filter_mode 无效")
     if not IMMICH_BASE_URL or not IMMICH_API_KEY:
@@ -602,6 +616,7 @@ async def fetch_random_assets(
             nonlocal fallback_seen
             if (
                 asset.id not in excluded_ids
+                or asset.id in omit_ids
                 or asset.id in selected_ids
                 or asset.id in fallback_reservoir_ids
             ):
@@ -638,6 +653,7 @@ async def fetch_random_assets(
                 asset
                 for asset in page_assets
                 if asset.id not in excluded_ids and asset.id not in selected_ids
+                and asset.id not in omit_ids
             ]
             if not eligible:
                 if filter_mode != "all":
@@ -755,6 +771,7 @@ async def fetch_random_assets(
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    await wait_for_actions()
     await immich_client.close()
 
 
@@ -1039,40 +1056,81 @@ async def api_next(payload: NextRequest) -> NextResponse:
         except Exception as exc:
             return 0, list(payload.delete_ids), str(exc)
 
-    album_result, delete_result = await asyncio.gather(
-        execute_album_action(), execute_delete_action()
-    )
-    album_added, failed_album, album_error, successful_album_ids = album_result
-    deleted_count, failed_delete, delete_error = delete_result
-
-    if album_added:
-        seen_repo.incr_counter("favorited_count", album_added)
-        cache_add_album_assets(FAV_ALBUM_NAME, successful_album_ids)
-    if deleted_count:
-        seen_repo.incr_counter("deleted_count", deleted_count)
-        _page_cache.clear()
-        seen_repo.clear_exhausted_pages()
-    album_error = album_error or delete_error
-
     force_validate = seen_repo.get_meta("current_restored") == "1"
     if force_validate:
         seen_repo.set_meta("current_restored", "0")
-    random_result = await fetch_random_assets(count, filter_mode, force_validate_pages=force_validate)
+    random_result = await fetch_random_assets(
+        count, filter_mode, force_validate_pages=force_validate,
+        omit_ids=set(payload.delete_ids) | set(payload.album_ids),
+    )
     store_current_round_from_items(count, filter_mode, random_result.assets)
+
+    job_id = None
+    if payload.album_ids or payload.delete_ids:
+        # Sample first so writes cannot hold up this round's image requests.
+        # Keep task references until completion, including when the browser closes.
+        job_id = uuid4().hex
+        job = {"done": False, "ids": list(set(payload.delete_ids + payload.album_ids))}
+        _action_jobs[job_id] = job
+        # Completed results are retained for polling, with bounded memory usage.
+        for old_id in list(_action_jobs):
+            if len(_action_jobs) <= 100:
+                break
+            if _action_jobs[old_id]["done"]:
+                del _action_jobs[old_id]
+
+        async def run_actions():
+            try:
+                album_result, delete_result = await asyncio.gather(
+                    execute_album_action(), execute_delete_action()
+                )
+                added, failed_album, album_error, successful_ids = album_result
+                deleted, failed_delete, delete_error = delete_result
+                if added:
+                    seen_repo.incr_counter("favorited_count", added)
+                if successful_ids:
+                    cache_add_album_assets(FAV_ALBUM_NAME, successful_ids)
+                if deleted:
+                    seen_repo.incr_counter("deleted_count", deleted)
+                    # This cache holds page counts, not image contents. Keep
+                    # the old upper bound until normal TTL expiry so deletes
+                    # do not force a slow tail probe on the next foreground
+                    # request. Every sampled page still comes live from Immich.
+                seen_repo.clear_exhausted_pages()
+                job.update(
+                    deleted=deleted, album_added=added,
+                    failed_delete=failed_delete, failed_album=failed_album,
+                    error=album_error or delete_error,
+                )
+            except Exception as exc:
+                job.update(error=str(exc), failed_delete=payload.delete_ids,
+                           failed_album=payload.album_ids)
+            finally:
+                job["done"] = True
+
+        task = asyncio.create_task(run_actions())
+        _action_tasks.add(task)
+        task.add_done_callback(_action_tasks.discard)
 
     return NextResponse(
         **random_result.dict(),
-        deleted=deleted_count,
-        album_added=album_added,
-        failed_delete=failed_delete,
-        failed_album=failed_album,
-        album_error=album_error,
+        action_job_id=job_id,
     )
+
+
+@app.get("/api/action-jobs/{job_id}")
+async def action_job_status(job_id: str) -> dict:
+    job = _action_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="后台任务记录已失效，请检查调试日志")
+    return {key: value for key, value in job.items() if key != "ids"}
 
 
 @app.get("/api/previous", response_model=RandomResponse)
 @serialized_operation
 async def api_previous() -> RandomResponse:
+    # Finish the original mutation before trying to undo it.
+    await wait_for_actions()
     if not seen_repo.is_prev_ready():
         raise HTTPException(status_code=404, detail="暂无上一轮记录")
     snapshot = seen_repo.get_prev_round()
@@ -1147,6 +1205,7 @@ async def api_previous() -> RandomResponse:
 @app.post("/api/reset-seen")
 @serialized_operation
 async def api_reset_seen() -> dict:
+    await wait_for_actions()
     # Delete seen album (do not delete assets) and reset local counters
     try:
         await immich_client.delete_album_by_name(SEEN_ALBUM_NAME)

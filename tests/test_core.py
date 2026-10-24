@@ -236,6 +236,85 @@ class SamplingTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(ratio, 0.52)
 
 
+class BackgroundActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_images_are_omitted_from_seen_fallback(self):
+        fake = FakeImmichClient({1: [asset("pending"), asset("seen")]}, total=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SeenRepository(str(Path(tmp) / "state.db"))
+            main._page_cache.clear()
+            with (
+                patch.object(main, "PAGE_SIZE", 2),
+                patch.object(main, "seen_repo", repo),
+                patch.object(main, "immich_client", fake),
+                patch.object(main, "_action_jobs", {"job": {"done": False, "ids": ["pending"]}}),
+                patch.object(main, "load_excluded_ids", AsyncMock(return_value={"pending", "seen"})),
+            ):
+                result = await main.fetch_random_assets(2, "exclude-prescreen")
+        self.assertEqual([item.id for item in result.assets], ["seen"])
+
+    async def test_next_returns_before_actions_and_previous_waits_before_undo(self):
+        gate = asyncio.Event()
+
+        async def slow_delete(ids):
+            await gate.wait()
+            return {}
+
+        client = AsyncMock()
+        client.delete_assets.side_effect = slow_delete
+        client.restore_assets.return_value = (1, [])
+        random_result = main.RandomResponse(
+            assets=[main.AssetItem(id="next")], total_returned=1,
+            requested=1, seen_count=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SeenRepository(str(Path(tmp) / "state.db"))
+            with (
+                patch.object(main, "seen_repo", repo),
+                patch.object(main, "immich_client", client),
+                patch.object(main, "_action_jobs", {}),
+                patch.object(main, "_action_tasks", set()),
+                patch.object(main, "fetch_random_assets", AsyncMock(return_value=random_result)) as sample,
+            ):
+                result = await asyncio.wait_for(main.api_next(main.NextRequest(
+                    count=1, filter_mode="all", delete_ids=["old"],
+                    current_assets=[main.RoundAsset(id="old", mark="delete")],
+                )), timeout=1)
+                self.assertEqual(result.assets[0].id, "next")
+                self.assertEqual(sample.await_args.kwargs["omit_ids"], {"old"})
+                self.assertFalse((await main.action_job_status(result.action_job_id))["done"])
+                previous = asyncio.create_task(main.api_previous())
+                await asyncio.sleep(0)
+                self.assertFalse(previous.done())
+                client.restore_assets.assert_not_awaited()
+                gate.set()
+                restored = await asyncio.wait_for(previous, timeout=1)
+                self.assertEqual(restored.assets[0].id, "old")
+                client.restore_assets.assert_awaited_once_with(["old"])
+                self.assertEqual(repo.get_counter("deleted_count"), 0)
+                self.assertTrue((await main.action_job_status(result.action_job_id))["done"])
+
+    async def test_background_failure_remains_visible_in_job_result(self):
+        client = AsyncMock()
+        client.delete_assets.side_effect = RuntimeError("offline")
+        random_result = main.RandomResponse(
+            assets=[], total_returned=0, requested=1, seen_count=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(main, "seen_repo", SeenRepository(str(Path(tmp) / "state.db"))),
+                patch.object(main, "immich_client", client),
+                patch.object(main, "_action_jobs", {}),
+                patch.object(main, "_action_tasks", set()),
+                patch.object(main, "fetch_random_assets", AsyncMock(return_value=random_result)),
+            ):
+                result = await main.api_next(main.NextRequest(count=1, delete_ids=["old"]))
+                await main.wait_for_actions()
+                job = await main.action_job_status(result.action_job_id)
+                self.assertTrue(job["done"])
+                self.assertEqual(job["failed_delete"], ["old"])
+                self.assertEqual(job["error"], "offline")
+
+
 class ClientConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_album_without_embedded_assets_falls_back_to_search(self):
         client = ImmichClient("http://immich.test", "test-key")
